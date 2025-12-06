@@ -1,4 +1,4 @@
-import FirecrawlApp, { SearchResponse } from '@mendable/firecrawl-js';
+import { search, SafeSearchType } from 'duck-duck-scrape';
 import { generateObject } from 'ai';
 import { compact } from 'lodash-es';
 import pLimit from 'p-limit';
@@ -26,15 +26,134 @@ type ResearchResult = {
   visitedUrls: string[];
 };
 
-// increase this if you have higher API rate limits
-const ConcurrencyLimit = Number(process.env.FIRECRAWL_CONCURRENCY) || 2;
+// Search result type (works for both DuckDuckGo and Firecrawl)
+type SearchResult = {
+  url: string;
+  title: string;
+  description: string;
+  markdown?: string;
+};
 
-// Initialize Firecrawl with optional API key and optional base url
+// Concurrency limit for searches
+const ConcurrencyLimit = Number(process.env.SEARCH_CONCURRENCY) || 2;
 
-const firecrawl = new FirecrawlApp({
-  apiKey: process.env.FIRECRAWL_KEY ?? '',
-  apiUrl: process.env.FIRECRAWL_BASE_URL,
-});
+// Firecrawl configuration
+const FIRECRAWL_API_URL = process.env.FIRECRAWL_API_URL || 'http://localhost:3002';
+const FIRECRAWL_API_KEY = process.env.FIRECRAWL_KEY || process.env.FIRECRAWL_API_KEY || 'fc-local-test-key';
+const USE_FIRECRAWL_SEARCH = process.env.USE_FIRECRAWL_SEARCH === 'true' || process.env.FIRECRAWL_API_URL?.includes('localhost');
+
+// Fetch page content and convert to simple text
+async function fetchPageContent(url: string): Promise<string> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; ResearchBot/1.0)',
+      },
+    });
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) return '';
+    
+    const html = await response.text();
+    // Simple HTML to text conversion - remove tags, scripts, styles
+    const text = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    return text.slice(0, 15000); // Limit content size
+  } catch (e) {
+    return '';
+  }
+}
+
+// Firecrawl search wrapper (uses local or cloud Firecrawl)
+async function firecrawlSearch(query: string, limit: number = 5): Promise<{ data: SearchResult[] }> {
+  try {
+    log(`Using Firecrawl search: ${FIRECRAWL_API_URL}`);
+    const response = await fetch(`${FIRECRAWL_API_URL}/v1/search`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${FIRECRAWL_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query, limit }),
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      log('Firecrawl search error:', errorText);
+      // Fallback to DuckDuckGo if Firecrawl fails
+      log('Falling back to DuckDuckGo...');
+      return duckDuckGoSearchFallback(query, limit);
+    }
+    
+    const result = await response.json();
+    if (!result.success || !result.data) {
+      log('Firecrawl returned unsuccessful response, falling back to DuckDuckGo');
+      return duckDuckGoSearchFallback(query, limit);
+    }
+    
+    // Firecrawl returns data with url, title, description, and optionally markdown
+    const searchResults = result.data.slice(0, limit).map((item: any) => ({
+      url: item.url,
+      title: item.title || '',
+      description: item.description || '',
+      markdown: item.markdown || item.description || `${item.title}\n\n${item.description || ''}`,
+    }));
+    
+    log(`Firecrawl found ${searchResults.length} results`);
+    return { data: searchResults };
+  } catch (e: any) {
+    log('Firecrawl search error:', e.message);
+    // Fallback to DuckDuckGo
+    log('Falling back to DuckDuckGo...');
+    return duckDuckGoSearchFallback(query, limit);
+  }
+}
+
+// DuckDuckGo search wrapper (fallback)
+async function duckDuckGoSearchFallback(query: string, limit: number = 5): Promise<{ data: SearchResult[] }> {
+  try {
+    const results = await search(query, {
+      safeSearch: SafeSearchType.MODERATE,
+    });
+    
+    const searchResults = results.results.slice(0, limit);
+    
+    // Fetch content for each result in parallel
+    const dataWithContent = await Promise.all(
+      searchResults.map(async (result) => {
+        const content = await fetchPageContent(result.url);
+        return {
+          url: result.url,
+          title: result.title,
+          description: result.description || '',
+          markdown: content || `${result.title}\n\n${result.description || ''}`,
+        };
+      })
+    );
+    
+    return { data: dataWithContent };
+  } catch (e: any) {
+    log('DuckDuckGo search error:', e.message);
+    return { data: [] };
+  }
+}
+
+// Main search function - uses Firecrawl if configured, otherwise DuckDuckGo
+async function webSearch(query: string, limit: number = 5): Promise<{ data: SearchResult[] }> {
+  if (USE_FIRECRAWL_SEARCH) {
+    return firecrawlSearch(query, limit);
+  }
+  return duckDuckGoSearchFallback(query, limit);
+}
 
 // take en user query, return a list of SERP queries
 async function generateSerpQueries({
@@ -85,7 +204,7 @@ async function processSerpResult({
   numFollowUpQuestions = 3,
 }: {
   query: string;
-  result: SearchResponse;
+  result: { data: SearchResult[] };
   numLearnings?: number;
   numFollowUpQuestions?: number;
 }) {
@@ -219,11 +338,7 @@ export async function deepResearch({
     serpQueries.map(serpQuery =>
       limit(async () => {
         try {
-          const result = await firecrawl.search(serpQuery.query, {
-            timeout: 15000,
-            limit: 5,
-            scrapeOptions: { formats: ['markdown'] },
-          });
+          const result = await webSearch(serpQuery.query, 5);
 
           // Collect URLs from this search
           const newUrls = compact(result.data.map(item => item.url));
