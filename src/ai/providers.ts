@@ -25,7 +25,7 @@ const fireworks = process.env.FIREWORKS_KEY
 
 const customModel = process.env.CUSTOM_MODEL
   ? openai?.(process.env.CUSTOM_MODEL, {
-      structuredOutputs: true,
+      structuredOutputs: false,
     })
   : undefined;
 
@@ -64,6 +64,7 @@ const encoder = getEncoding('o200k_base');
 export function trimPrompt(
   prompt: string,
   contextSize = Number(process.env.CONTEXT_SIZE) || 128_000,
+  maxDepth = 10,
 ) {
   if (!prompt) {
     return '';
@@ -72,6 +73,11 @@ export function trimPrompt(
   const length = encoder.encode(prompt).length;
   if (length <= contextSize) {
     return prompt;
+  }
+
+  if (maxDepth <= 0) {
+    const hardCutSize = Math.max(MinChunkSize, Math.floor(prompt.length * (contextSize / length)));
+    return prompt.slice(0, hardCutSize);
   }
 
   const overflowTokens = length - contextSize;
@@ -89,9 +95,9 @@ export function trimPrompt(
 
   // last catch, there's a chance that the trimmed prompt is same length as the original prompt, due to how tokens are split & innerworkings of the splitter, handle this case by just doing a hard cut
   if (trimmedPrompt.length === prompt.length) {
-    return trimPrompt(prompt.slice(0, chunkSize), contextSize);
+    return trimPrompt(prompt.slice(0, chunkSize), contextSize, maxDepth - 1);
   }
 
   // recursively trim until the prompt is within the context size
-  return trimPrompt(trimmedPrompt, contextSize);
+  return trimPrompt(trimmedPrompt, contextSize, maxDepth - 1);
 }

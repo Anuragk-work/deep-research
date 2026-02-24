@@ -34,13 +34,22 @@ type SearchResult = {
   markdown?: string;
 };
 
-// Concurrency limit for searches
-const ConcurrencyLimit = Number(process.env.SEARCH_CONCURRENCY) || 2;
-
-// Firecrawl configuration
-const FIRECRAWL_API_URL = process.env.FIRECRAWL_API_URL || 'http://localhost:3002';
-const FIRECRAWL_API_KEY = process.env.FIRECRAWL_KEY || process.env.FIRECRAWL_API_KEY || 'fc-local-test-key';
-const USE_FIRECRAWL_SEARCH = process.env.USE_FIRECRAWL_SEARCH === 'true' || process.env.FIRECRAWL_API_URL?.includes('localhost');
+// Concurrency limit for searches (higher when using Firecrawl)
+const FIRECRAWL_BASE = process.env.FIRECRAWL_BASE_URL || process.env.FIRECRAWL_API_URL || 'http://localhost:3002';
+const FIRECRAWL_KEY = process.env.FIRECRAWL_KEY || process.env.FIRECRAWL_API_KEY || 'fc-local-test-key';
+const hasFirecrawlKey = !!(
+  (process.env.FIRECRAWL_KEY && process.env.FIRECRAWL_KEY !== 'fc-local-test-key') ||
+  (process.env.FIRECRAWL_API_KEY && process.env.FIRECRAWL_API_KEY !== 'fc-local-test-key')
+);
+const useFirecrawlSearch =
+  process.env.USE_FIRECRAWL_SEARCH === 'true' ||
+  FIRECRAWL_BASE.includes('localhost') ||
+  FIRECRAWL_BASE.includes('127.0.0.1') ||
+  hasFirecrawlKey;
+const useFirecrawlScrape = process.env.USE_FIRECRAWL_SCRAPE !== 'false' && (useFirecrawlSearch || !!FIRECRAWL_KEY);
+const ConcurrencyLimit =
+  Number(process.env.SEARCH_CONCURRENCY) ||
+  (useFirecrawlSearch ? 4 : 2);
 
 // Fetch page content and convert to simple text
 async function fetchPageContent(url: string): Promise<string> {
@@ -73,46 +82,74 @@ async function fetchPageContent(url: string): Promise<string> {
   }
 }
 
-// Firecrawl search wrapper (uses local or cloud Firecrawl)
-async function firecrawlSearch(query: string, limit: number = 5): Promise<{ data: SearchResult[] }> {
+// Firecrawl scrape: fetch full page markdown (works with Docker or cloud Firecrawl)
+async function firecrawlScrape(url: string): Promise<string> {
   try {
-    log(`Using Firecrawl search: ${FIRECRAWL_API_URL}`);
-    const response = await fetch(`${FIRECRAWL_API_URL}/v1/search`, {
+    const response = await fetch(`${FIRECRAWL_BASE}/v1/scrape`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${FIRECRAWL_API_KEY}`,
+        Authorization: `Bearer ${FIRECRAWL_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ url, formats: ['markdown'] }),
+    });
+    if (!response.ok) return '';
+    const result = await response.json();
+    const md = result?.data?.markdown;
+    return typeof md === 'string' ? md.slice(0, 30000) : '';
+  } catch (e: any) {
+    return '';
+  }
+}
+
+// Firecrawl search wrapper (Docker or cloud; FIRECRAWL_BASE_URL for Docker)
+async function firecrawlSearch(query: string, limit: number = 5): Promise<{ data: SearchResult[] }> {
+  try {
+    log(`Using Firecrawl search: ${FIRECRAWL_BASE}`);
+    const response = await fetch(`${FIRECRAWL_BASE}/v1/search`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${FIRECRAWL_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ query, limit }),
     });
-    
+
     if (!response.ok) {
       const errorText = await response.text();
       log('Firecrawl search error:', errorText);
-      // Fallback to DuckDuckGo if Firecrawl fails
       log('Falling back to DuckDuckGo...');
       return duckDuckGoSearchFallback(query, limit);
     }
-    
+
     const result = await response.json();
     if (!result.success || !result.data) {
       log('Firecrawl returned unsuccessful response, falling back to DuckDuckGo');
       return duckDuckGoSearchFallback(query, limit);
     }
-    
-    // Firecrawl returns data with url, title, description, and optionally markdown
+
     const searchResults = result.data.slice(0, limit).map((item: any) => ({
       url: item.url,
       title: item.title || '',
       description: item.description || '',
       markdown: item.markdown || item.description || `${item.title}\n\n${item.description || ''}`,
     }));
-    
+
+    if (useFirecrawlScrape) {
+      const scrapeTop = 2;
+      for (let i = 0; i < Math.min(scrapeTop, searchResults.length); i++) {
+        const item = searchResults[i];
+        if (!item.markdown || item.markdown.length < 500) {
+          const scraped = await firecrawlScrape(item.url);
+          if (scraped) item.markdown = scraped;
+        }
+      }
+    }
+
     log(`Firecrawl found ${searchResults.length} results`);
     return { data: searchResults };
   } catch (e: any) {
     log('Firecrawl search error:', e.message);
-    // Fallback to DuckDuckGo
     log('Falling back to DuckDuckGo...');
     return duckDuckGoSearchFallback(query, limit);
   }
@@ -147,9 +184,9 @@ async function duckDuckGoSearchFallback(query: string, limit: number = 5): Promi
   }
 }
 
-// Main search function - uses Firecrawl if configured, otherwise DuckDuckGo
+// Main search function - uses Firecrawl when Docker/cloud configured, otherwise DuckDuckGo
 async function webSearch(query: string, limit: number = 5): Promise<{ data: SearchResult[] }> {
-  if (USE_FIRECRAWL_SEARCH) {
+  if (useFirecrawlSearch) {
     return firecrawlSearch(query, limit);
   }
   return duckDuckGoSearchFallback(query, limit);
@@ -387,15 +424,16 @@ export async function deepResearch({
               visitedUrls: allUrls,
             };
           }
-        } catch (e: any) {
-          if (e.message && e.message.includes('Timeout')) {
-            log(`Timeout error running query: ${serpQuery.query}: `, e);
-          } else {
-            log(`Error running query: ${serpQuery.query}: `, e);
-          }
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : String(e);
+          const isTimeout = message.includes('Timeout');
+          log(
+            `${isTimeout ? 'Timeout' : 'Error'} running query: ${serpQuery.query}: `,
+            message,
+          );
           return {
-            learnings: [],
-            visitedUrls: [],
+            learnings: [...learnings],
+            visitedUrls: [...visitedUrls],
           };
         }
       }),
