@@ -4,7 +4,10 @@ services:
     build: .
     env_file:
       - .env.local
-    volumes:
-      -  ./:/app/
+    ports:
+      - "3051:3051"
+    # Don't mount volumes - it overwrites the container's node_modules with macOS versions
+    # volumes:
+    #   -  ./:/app/
     tty: true
     stdin_open: true
